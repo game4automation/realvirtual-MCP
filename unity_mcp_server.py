@@ -24,7 +24,7 @@ WebSocket Protocol (Port 18711):
   __heartbeat__ -> {status: "ok", tools_count: N}
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import argparse
 import asyncio
