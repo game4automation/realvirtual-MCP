@@ -32,6 +32,7 @@ import ctypes.wintypes
 import enum
 import json
 import logging
+import os
 import struct
 import sys
 import tempfile
@@ -66,8 +67,13 @@ RECONNECT_BASE_DELAY = 1.0
 RECONNECT_MAX_DELAY = 30.0
 RECONNECT_MULTIPLIER = 2.0
 
-# Tool call timeout
-TOOL_CALL_TIMEOUT = 10.0
+# Tool call timeout (seconds) - default for most tools
+TOOL_CALL_TIMEOUT = 15.0
+
+# Extended timeout for heavy tools (screenshots, validation, etc.)
+TOOL_CALL_TIMEOUT_LONG = 60.0
+LONG_TIMEOUT_TOOLS = {"screenshot_editor", "screenshot_game", "screenshot_scene",
+                      "assetstore_validate", "validation_run", "test_run"}
 
 # Watchdog interval (seconds) - heartbeat check when connected
 WATCHDOG_INTERVAL = 3.0
@@ -507,19 +513,22 @@ class UnityConnection:
             _focus_unity_window()
 
         try:
+            timeout = (TOOL_CALL_TIMEOUT_LONG
+                       if tool_name in LONG_TIMEOUT_TOOLS
+                       else TOOL_CALL_TIMEOUT)
             async with self._lock:
                 payload = json.dumps(command)
-                logger.debug(f">> {label} ({len(payload)} bytes)")
+                logger.debug(f">> {label} ({len(payload)} bytes, timeout={timeout}s)")
                 await self.ws.send(payload)
                 response = await asyncio.wait_for(
                     self.ws.recv(),
-                    timeout=TOOL_CALL_TIMEOUT
+                    timeout=timeout
                 )
                 self._last_comm_time = time.monotonic()
                 logger.debug(f"<< {label} ({len(response)} bytes)")
                 return json.loads(response)
         except asyncio.TimeoutError:
-            logger.error(f"Timeout ({TOOL_CALL_TIMEOUT}s) waiting for {label}")
+            logger.error(f"Timeout ({timeout}s) waiting for {label}")
             self.circuit_breaker.record_failure()
             return None
         except websockets.exceptions.ConnectionClosed as e:
@@ -662,6 +671,18 @@ class UnityConnection:
                     "message": "Waiting for Unity Editor connection...",
                     "state": "starting",
                 })
+
+        # Python-side screenshot: capture Unity window via Win32 PrintWindow
+        # (works even when Unity is backgrounded - no main thread dispatch needed)
+        if tool_name == "screenshot_editor" and sys.platform == "win32":
+            try:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None, _capture_screenshot_editor, arguments
+                )
+                return result
+            except Exception as e:
+                logger.warning(f"Python screenshot failed ({e}), falling back to Unity")
+                # Fall through to Unity-side capture
 
         # STATE: READY - forward to Unity
         if not self.connected:
@@ -1017,11 +1038,64 @@ def create_server(
         ),
     )
 
-    # screenshot_editor is now implemented in C# (ScreenshotTools.ScreenshotEditor)
-    # using Unity's InternalEditorUtility.ReadScreenPixel for DPI-correct capture.
-    # The Python GDI-based capture has been removed.
+    # screenshot_editor is intercepted Python-side in call_tool() using Win32
+    # PrintWindow API for reliable capture even when Unity is backgrounded.
+    # Falls back to the C# implementation if Python capture fails.
 
     return mcp_server, unity, registered_names, watchdog_holder
+
+
+def _capture_screenshot_editor(arguments: dict) -> str:
+    """Python-side screenshot_editor: captures Unity window via Win32 PrintWindow.
+
+    Called from a thread executor to avoid blocking the async event loop.
+    Returns JSON string matching the C# ScreenshotEditor response format.
+    """
+    save_path = arguments.get("save_path", "")
+
+    png_bytes, width, height = _capture_unity_window()
+    base64_str = base64.b64encode(png_bytes).decode("ascii")
+
+    # Save to file
+    saved_to = None
+    if save_path:
+        try:
+            parent = os.path.dirname(save_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(save_path, "wb") as f:
+                f.write(png_bytes)
+            saved_to = save_path
+        except Exception as e:
+            logger.warning(f"Failed to save screenshot to '{save_path}': {e}")
+
+    if saved_to is None:
+        # Save to default .screenshots/ directory
+        screenshots_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "..", ".screenshots"
+        )
+        os.makedirs(screenshots_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"editor_{ts}.png"
+        saved_to = os.path.join(screenshots_dir, filename)
+        try:
+            with open(saved_to, "wb") as f:
+                f.write(png_bytes)
+        except Exception:
+            saved_to = None
+
+    return json.dumps({
+        "status": "ok",
+        "_image": base64_str,
+        "_mimeType": "image/png",
+        "width": width,
+        "height": height,
+        "panel": "editor",
+        "format": "png",
+        "savedTo": saved_to,
+        "source": "python-printwindow",
+    })
 
 
 def _capture_unity_window() -> tuple[bytes, int, int]:
