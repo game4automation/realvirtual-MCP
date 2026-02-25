@@ -56,6 +56,10 @@ To update later, click **Update Python Server (git pull)** in the same popup.
 
 <img src="docs/mcp-setup.png" alt="MCP Setup Popup" width="500">
 
+### Requirements
+
+- **git** must be installed and available in PATH — [git-scm.com](https://git-scm.com)
+
 ### Manual Setup
 
 Clone the repository into your Unity project's StreamingAssets folder:
