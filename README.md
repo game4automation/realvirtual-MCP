@@ -4,6 +4,17 @@
 
 This server bridges AI agents (Claude Desktop, Claude Code, Cursor, etc.) with the Unity Editor via WebSocket. Unity defines MCP tools in C# using `[McpTool]` attributes. This server discovers them automatically and exposes them as standard [MCP](https://modelcontextprotocol.io) tools.
 
+### You Never Need to Touch This Code
+
+Unlike other MCP servers where you edit Python to add tools, this server is a **transparent bridge**. All tools are defined in C# inside Unity using simple attributes:
+
+```csharp
+[McpTool("Spawn an enemy")]
+public static string SpawnEnemy([McpParam("Prefab name")] string prefab) { ... }
+```
+
+The Python server discovers new tools automatically after Unity recompiles. No Python changes, no server restart, no registration. See the [Unity MCP package](https://github.com/game4automation/io.realvirtual.mcp) for how to create custom tools.
+
 ```
 AI Agent (Claude Desktop / Claude Code / Cursor)
     |
