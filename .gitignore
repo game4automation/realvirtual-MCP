@@ -13,7 +13,9 @@ tool_schema_cache.json
 Thumbs.db
 
 # Build artifacts
-*.exe
 *.zip
 build/
 dist/
+
+# Nuitka build output (but NOT embedded Python runtime)
+unity_mcp_server.exe
