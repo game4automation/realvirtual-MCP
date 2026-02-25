@@ -1,0 +1,6 @@
+python312.zip
+.
+../Lib
+../Lib/win32
+../Lib/win32/lib
+import site

@@ -1,7 +1,3 @@
-# Embedded Python runtime (downloaded separately)
-python/
-Lib/
-
 # Unity meta files
 *.meta
 
