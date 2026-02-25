@@ -232,6 +232,12 @@ The C# Unity side of this integration:
 
 Install via Unity Package Manager > Add package from git URL.
 
+## Support
+
+This server is provided **as-is** with no support or service included.
+
+For commercial customers of [realvirtual](https://realvirtual.io), we offer professional services for **digital twin development**, **virtual commissioning**, and **LLM/AI agent integration**. Contact us at https://realvirtual.io for details.
+
 ## License
 
 MIT License - Copyright (c) 2026 realvirtual GmbH
