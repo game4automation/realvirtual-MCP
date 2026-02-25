@@ -1,0 +1,23 @@
+# Embedded Python runtime (downloaded separately)
+python/
+Lib/
+
+# Unity meta files
+*.meta
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Tool schema cache (generated at runtime)
+tool_schema_cache.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.exe
+*.zip
+build/
+dist/
