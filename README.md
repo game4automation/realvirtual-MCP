@@ -1,10 +1,10 @@
 # realvirtual MCP Server (Python)
 
-**Python MCP bridge that connects AI agents to any Unity project.**
+**Python MCP bridge that connects AI agents to any Unity project - including digital twins, robotics, and industrial automation.**
 
 This server bridges AI agents (Claude Desktop, Claude Code, Cursor, etc.) with the Unity Editor via WebSocket. Unity defines MCP tools in C# using `[McpTool]` attributes. This server discovers them automatically and exposes them as standard [MCP](https://modelcontextprotocol.io) tools.
 
-Works with **any Unity project** out of the box. When combined with [**realvirtual**](https://realvirtual.io) ([Unity Asset Store](https://assetstore.unity.com/packages/slug/311006)), additional tools for industrial digital twins are available - drives, sensors, PLC signals, and robot inverse kinematics.
+Works with **any Unity project** out of the box. When combined with [**realvirtual**](https://realvirtual.io) ([Unity Asset Store](https://assetstore.unity.com/packages/slug/311006)), additional tools for industrial digital twins and virtual commissioning are available - motor drives, conveyor control, industrial sensors, PLC signal I/O, and robot inverse kinematics.
 
 ### You Never Need to Touch This Code
 
