@@ -43,15 +43,33 @@ requirements.txt     Dependency list (for reference)
 
 ## Quick Start
 
-### Automatic Setup (via Unity)
+### Automated Setup (via Unity — recommended)
 
-The [Unity MCP package](https://github.com/game4automation/io.realvirtual.mcp) can download and configure this server automatically:
+The [Unity MCP package](https://github.com/game4automation/io.realvirtual.mcp) can clone and configure this server automatically:
 
-1. Install the Unity package
+1. Install the Unity package via Package Manager (git URL: `https://github.com/game4automation/io.realvirtual.mcp.git`)
 2. Click the **gear icon** in the Unity MCP toolbar
-3. Click **Download Python Server** and **Configure Claude**
+3. Click **Clone Python Server** — this runs `git clone` into `Assets/StreamingAssets/realvirtual-MCP/`
+4. Click **Configure Claude** — writes the MCP configuration to Claude Desktop and/or Claude Code
+
+To update later, click **Update Python Server (git pull)** in the same popup.
 
 <img src="docs/mcp-setup.png" alt="MCP Setup Popup" width="500">
+
+### Manual Setup
+
+Clone the repository into your Unity project's StreamingAssets folder:
+
+```bash
+cd <your-project>/Assets/StreamingAssets
+git clone https://github.com/game4automation/realvirtual-MCP.git
+```
+
+To update later:
+```bash
+cd <your-project>/Assets/StreamingAssets/realvirtual-MCP
+git pull
+```
 
 ### Manual Configuration
 
