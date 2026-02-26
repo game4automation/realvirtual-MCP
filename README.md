@@ -4,7 +4,7 @@
 
 This server bridges AI agents (Claude Desktop, Claude Code, Cursor, etc.) with the Unity Editor via WebSocket. Unity defines MCP tools in C# using `[McpTool]` attributes. This server discovers them automatically and exposes them as standard [MCP](https://modelcontextprotocol.io) tools.
 
-Works with **any Unity project** out of the box. When combined with [**realvirtual**](https://realvirtual.io) ([Unity Asset Store](https://assetstore.unity.com/packages/slug/311006)), additional tools for industrial digital twins and virtual commissioning are available - motor drives, conveyor control, industrial sensors, PLC signal I/O, and robot inverse kinematics.
+Works with **any Unity project** out of the box. When combined with [**realvirtual**](https://realvirtual.io) ([Unity Asset Store](https://assetstore.unity.com/packages/tools/integration/realvirtual-io-digital-twin-professional-6-301340)), additional tools for industrial digital twins and virtual commissioning are available - motor drives, conveyor control, industrial sensors, PLC signal I/O, and robot inverse kinematics.
 
 ### You Never Need to Touch This Code
 
@@ -210,7 +210,7 @@ Tools are auto-discovered from Unity. The exact set depends on which Unity packa
 | **Sensors** | `sensor_list`, `sensor_get` | Sensor states* |
 | **Signals** | `signal_list`, `signal_set_bool` | PLC signal I/O* |
 
-*Requires the [realvirtual](https://assetstore.unity.com/packages/slug/311006) Unity framework.
+*Requires the [realvirtual](https://assetstore.unity.com/packages/tools/integration/realvirtual-io-digital-twin-professional-6-301340) Unity framework.
 
 Two built-in management tools are always available:
 - `unity_status` - Connection status and tool count
@@ -271,5 +271,6 @@ See [LICENSE](LICENSE) for full text.
 - Website: https://realvirtual.io
 - Documentation: https://doc.realvirtual.io/extensions/mcp-server
 - Unity MCP Package: https://github.com/game4automation/io.realvirtual.mcp
-- Unity Asset Store (realvirtual): https://assetstore.unity.com/packages/slug/311006
 - Unity Asset Store (MCP Server): https://assetstore.unity.com/preview/361912/1260684
+- Unity Asset Store (Starter): https://assetstore.unity.com/packages/tools/integration/realvirtual-io-digital-twin-starter-6-303030
+- Unity Asset Store (Professional): https://assetstore.unity.com/packages/tools/integration/realvirtual-io-digital-twin-professional-6-301340
