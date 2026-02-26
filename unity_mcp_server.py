@@ -942,6 +942,9 @@ def create_server(
             registered_names.clear()
             register_tools(mcp_server, unity.tools, unity, registered_names)
             new_tools = len(registered_names) - old_count
+            # Notify MCP client that tool list changed
+            if hasattr(mcp_server, '_notify_tools_changed'):
+                await mcp_server._notify_tools_changed()
             result = {
                 "status": "reconnected",
                 "tools_count": len(unity.tools),
@@ -1282,6 +1285,9 @@ async def run_watchdog(unity: UnityConnection, cache_dir: Path | None,
                         logger.info(f"Watchdog: cleared {old_count} registered tools for re-registration after reload")
                     register_tools(mcp_server, unity.tools, unity, registered_names)
                     delay = RECONNECT_BASE_DELAY
+                    # Notify MCP client that tool list changed
+                    if hasattr(mcp_server, '_notify_tools_changed'):
+                        await mcp_server._notify_tools_changed()
 
                     # Flush buffered messages after reconnect
                     if unity.buffer.size > 0:
@@ -1465,6 +1471,52 @@ def main(argv: list[str] | None = None):
         logger.debug("Watchdog hooked into MCP initialized notification")
     except Exception as e:
         logger.warning(f"Could not hook watchdog into MCP lifecycle: {e}")
+
+    # Enable tools_changed notification so clients re-discover tools after
+    # the watchdog registers new ones from Unity.
+    # Monkey-patch create_initialization_options to set tools_changed=True.
+    _orig_create_init = mcp_server._mcp_server.create_initialization_options
+    def _patched_create_init(notification_options=None, experimental_capabilities=None):
+        from mcp.server.lowlevel.server import NotificationOptions
+        opts = notification_options or NotificationOptions()
+        opts.tools_changed = True
+        return _orig_create_init(opts, experimental_capabilities)
+    mcp_server._mcp_server.create_initialization_options = _patched_create_init
+
+    # Store session reference so watchdog can send tool list change notifications.
+    # Monkey-patch the low-level server's run() to capture the session.
+    _active_session = [None]
+    _orig_run = mcp_server._mcp_server.run
+    async def _patched_run(read_stream, write_stream, initialization_options, **kwargs):
+        from mcp.server.session import ServerSession
+        from contextlib import AsyncExitStack
+        import anyio
+        async with AsyncExitStack() as stack:
+            lifespan_context = await stack.enter_async_context(
+                mcp_server._mcp_server.lifespan(mcp_server._mcp_server))
+            session = await stack.enter_async_context(
+                ServerSession(read_stream, write_stream, initialization_options,
+                              stateless=kwargs.get("stateless", False)))
+            _active_session[0] = session
+            logger.info("MCP session captured for tool list change notifications")
+            async with anyio.create_task_group() as tg:
+                async for message in session.incoming_messages:
+                    tg.start_soon(
+                        mcp_server._mcp_server._handle_message,
+                        message, session, lifespan_context,
+                        kwargs.get("raise_exceptions", False))
+    mcp_server._mcp_server.run = _patched_run
+
+    # Expose session reference and notification helper for the watchdog
+    async def notify_tools_changed():
+        session = _active_session[0]
+        if session:
+            try:
+                await session.send_tool_list_changed()
+                logger.info("Sent tools/list_changed notification to MCP client")
+            except Exception as e:
+                logger.debug(f"Could not send tools/list_changed: {e}")
+    mcp_server._notify_tools_changed = notify_tools_changed
 
     logger.info(
         f"Starting realvirtual MCP Server (mode={args.mode}, "
