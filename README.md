@@ -269,6 +269,7 @@ See [LICENSE](LICENSE) for full text.
 ## Links
 
 - Website: https://realvirtual.io
-- Documentation: https://doc.realvirtual.io
+- Documentation: https://doc.realvirtual.io/extensions/mcp-server
 - Unity MCP Package: https://github.com/game4automation/io.realvirtual.mcp
-- Unity Asset Store: https://assetstore.unity.com/packages/slug/311006
+- Unity Asset Store (realvirtual): https://assetstore.unity.com/packages/slug/311006
+- Unity Asset Store (MCP Server): https://assetstore.unity.com/preview/361912/1260684
