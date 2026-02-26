@@ -13,9 +13,12 @@ tool_schema_cache.json
 Thumbs.db
 
 # Build artifacts
-*.zip
 build/
 dist/
 
 # Nuitka build output (but NOT embedded Python runtime)
 unity_mcp_server.exe
+
+# Pip distlib executables (not needed for runtime)
+python/Lib/site-packages/pip/_vendor/distlib/*.exe
+python/Scripts/
