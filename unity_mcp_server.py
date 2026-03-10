@@ -24,7 +24,7 @@ WebSocket Protocol (Port 18711):
   __heartbeat__ -> {status: "ok", tools_count: N}
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import argparse
 import asyncio
@@ -391,6 +391,7 @@ class UnityConnection:
         self.ws: Any = None
         self._connected = False
         self._tools: list[dict] = []
+        self._instructions: str = ""
         self._schema_version: str = ""
         self._reconnect_delay = RECONNECT_BASE_DELAY
         self._lock = asyncio.Lock()
@@ -572,11 +573,14 @@ class UnityConnection:
         response = await self._send_command({"command": "__discover__"})
         if response and "tools" in response:
             self._tools = response["tools"]
+            self._instructions = response.get("instructions", "")
             self._schema_version = response.get("schema_version", "unknown")
             logger.info(
                 f"Discovered {len(self._tools)} tools "
                 f"(schema v{self._schema_version})"
             )
+            if self._instructions:
+                logger.info(f"Received MCP instructions ({len(self._instructions)} chars)")
             return True
         return False
 
@@ -719,13 +723,16 @@ def get_cache_path(cache_dir: Path | None = None) -> Path:
 
 
 def save_schema_cache(tools: list[dict], schema_version: str,
-                      cache_dir: Path | None = None):
+                      cache_dir: Path | None = None,
+                      instructions: str = ""):
     cache_path = get_cache_path(cache_dir)
     cache_data = {
         "schema_version": schema_version,
         "cached_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "tools": tools,
     }
+    if instructions:
+        cache_data["instructions"] = instructions
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(
@@ -737,24 +744,29 @@ def save_schema_cache(tools: list[dict], schema_version: str,
         logger.warning(f"Failed to save schema cache: {e}")
 
 
-def load_schema_cache(cache_dir: Path | None = None) -> list[dict] | None:
+def load_schema_cache(cache_dir: Path | None = None) -> tuple[list[dict] | None, str]:
+    """Load cached tool schemas and instructions.
+
+    Returns (tools, instructions) tuple. tools is None if no cache exists.
+    """
     cache_path = get_cache_path(cache_dir)
     if not cache_path.exists():
-        return None
+        return None, ""
 
     try:
         cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
         tools = cache_data.get("tools", [])
+        cached_instructions = cache_data.get("instructions", "")
         cached_at = cache_data.get("cached_at", "unknown")
         version = cache_data.get("schema_version", "unknown")
         logger.info(
             f"Loaded {len(tools)} tools from cache "
             f"(v{version}, cached {cached_at})"
         )
-        return tools
+        return tools, cached_instructions
     except Exception as e:
         logger.warning(f"Failed to load schema cache: {e}")
-        return None
+        return None, ""
 
 
 def _convert_image_response(result: str):
@@ -881,7 +893,7 @@ def create_server(
     """
     mcp_server = FastMCP("realvirtual", host=http_host, port=http_port)
 
-    cached_tools = load_schema_cache(cache_dir)
+    cached_tools, cached_instructions = load_schema_cache(cache_dir)
     unity = UnityConnection(ws_host, ws_port, ws_path, auth_token)
     registered_names: set[str] = set()
     # Mutable holder for watchdog callback (set by main after create_server)
@@ -893,9 +905,16 @@ def create_server(
 
     if cached_tools:
         unity._tools = cached_tools
+        if cached_instructions:
+            unity._instructions = cached_instructions
         register_tools(mcp_server, cached_tools, unity, registered_names,
                        ensure_watchdog=_trigger_watchdog)
         logger.info(f"Pre-loaded {len(registered_names)} tools from cache")
+
+    # Apply instructions (from cache or live discovery)
+    if cached_instructions:
+        mcp_server._mcp_server.instructions = cached_instructions
+        logger.info(f"Applied cached MCP instructions ({len(cached_instructions)} chars)")
 
     # --- Built-in management tools ---
 
@@ -936,7 +955,11 @@ def create_server(
             unity._set_state(State.RECONNECTING)
         success = await unity.connect()
         if success and unity.tools:
-            save_schema_cache(unity.tools, unity._schema_version, cache_dir)
+            save_schema_cache(unity.tools, unity._schema_version, cache_dir,
+                              instructions=unity._instructions)
+            # Apply fresh instructions from Unity
+            if unity._instructions:
+                mcp_server._mcp_server.instructions = unity._instructions
             # Clear and re-register all tools to pick up new ones after recompile
             old_count = len(registered_names)
             registered_names.clear()
@@ -969,7 +992,10 @@ def create_server(
 
         Polls the connection state and returns as soon as Unity is connected
         and responsive. Use after editor_recompile or editor_refresh_assets
-        instead of blind sleep. Returns immediately if already ready.
+        instead of sleeping. Returns immediately if already ready.
+
+        The response includes a 'phases' list showing what Unity went through
+        (e.g. disconnected → domain_reload → compiling → ready) with timestamps.
         """
         if timeout is None:
             timeout = 60.0
@@ -977,14 +1003,32 @@ def create_server(
         start = time.monotonic()
         poll_interval = 0.5  # fast polling for responsiveness
 
+        # Track phases for clear feedback
+        phases: list[dict] = []
+        current_phase = None
+
+        def _record_phase(phase_name: str) -> None:
+            nonlocal current_phase
+            if phase_name != current_phase:
+                elapsed = round(time.monotonic() - start, 1)
+                phases.append({"phase": phase_name, "at": f"{elapsed}s"})
+                current_phase = phase_name
+                logger.info(
+                    f"editor_wait_ready: [{phase_name}] at {elapsed}s"
+                )
+
+        _record_phase("waiting")
+
         while True:
             elapsed = time.monotonic() - start
             if elapsed >= timeout:
+                _record_phase("timeout")
                 return json.dumps({
                     "status": "timeout",
                     "error": f"Unity not ready after {timeout:.0f}s",
                     "state": unity.state.value,
                     "elapsed": round(elapsed, 1),
+                    "phases": phases,
                 })
 
             # If connected, verify with heartbeat
@@ -998,31 +1042,43 @@ def create_server(
                         status_data = json.loads(status_result)
                         is_playing = status_data.get("isPlaying", False)
                         if is_playing:
+                            _record_phase("playing")
                             return json.dumps({
                                 "status": "playing",
                                 "error": "Unity is in play mode. Stop the simulation first (sim_stop) before recompiling or waiting for ready.",
                                 "state": unity.state.value,
                                 "isPlaying": True,
                                 "waited": round(elapsed, 1),
+                                "phases": phases,
                             })
-                        is_busy = (status_data.get("isCompiling", False)
-                                   or status_data.get("isUpdating", False))
-                        if not is_busy:
+                        is_compiling = status_data.get("isCompiling", False)
+                        is_updating = status_data.get("isUpdating", False)
+                        if is_compiling and is_updating:
+                            _record_phase("compiling+importing")
+                        elif is_compiling:
+                            _record_phase("compiling")
+                        elif is_updating:
+                            _record_phase("importing")
+                        if not is_compiling and not is_updating:
+                            _record_phase("ready")
                             return json.dumps({
                                 "status": "ready",
                                 "state": unity.state.value,
                                 "tools_count": len(unity.tools),
                                 "waited": round(elapsed, 1),
+                                "phases": phases,
                             })
-                        # Still compiling, keep polling
-                        logger.debug(
-                            f"editor_wait_ready: Unity busy "
-                            f"(compiling={status_data.get('isCompiling')}, "
-                            f"updating={status_data.get('isUpdating')}), "
-                            f"elapsed={elapsed:.1f}s"
-                        )
                     except Exception:
                         pass  # Fall through to retry
+            else:
+                # Track disconnection/reload phases
+                state_val = unity.state.value
+                if state_val == "reloading":
+                    _record_phase("domain_reload")
+                elif state_val == "reconnecting":
+                    _record_phase("reconnecting")
+                else:
+                    _record_phase(f"disconnected({state_val})")
 
             # Not ready yet, try reconnecting if disconnected
             if not unity.connected:
@@ -1277,7 +1333,11 @@ async def run_watchdog(unity: UnityConnection, cache_dir: Path | None,
                         f"Watchdog: connected to Unity "
                         f"(was {'reloading' if was_reloading else 'disconnected'})"
                     )
-                    save_schema_cache(unity.tools, unity._schema_version, cache_dir)
+                    save_schema_cache(unity.tools, unity._schema_version, cache_dir,
+                                      instructions=unity._instructions)
+                    # Apply fresh instructions from Unity
+                    if unity._instructions:
+                        mcp_server._mcp_server.instructions = unity._instructions
                     # Clear registered names after domain reload so new tools get registered
                     if was_reloading:
                         old_count = len(registered_names)
