@@ -24,7 +24,7 @@ WebSocket Protocol (Port 18711):
   __heartbeat__ -> {status: "ok", tools_count: N}
 """
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 import argparse
 import asyncio
@@ -35,7 +35,9 @@ import enum
 import json
 import logging
 import os
+import re
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -63,6 +65,10 @@ DEFAULT_WS_HOST = "127.0.0.1"
 DEFAULT_WS_PORT = 18711
 DEFAULT_WS_PATH = "/mcp"
 DEFAULT_HTTP_PORT = 8080
+
+# WebViewer bridge config
+DEFAULT_WV_PORT = 18712
+DEFAULT_WV_PATH = "/webviewer"
 
 # Reconnect config
 RECONNECT_BASE_DELAY = 1.0
@@ -99,6 +105,17 @@ DISCOVERY_DIR = Path.home() / ".unity-mcp"
 
 # Max age in seconds for a status file to be considered valid
 DISCOVERY_MAX_AGE = 30.0
+
+# Main thread stall threshold (seconds). Above this, the Unity editor main
+# thread is reported as blocked. The WebSocket heartbeat alone stays alive
+# during a freeze because it is answered on a background thread.
+MAIN_THREAD_STALL_THRESHOLD = 5.0
+
+# Timeout for PowerShell process queries (seconds)
+PROCESS_QUERY_TIMEOUT = 20.0
+
+# How long unity_restart waits for killed Unity PIDs to disappear (seconds)
+KILL_WAIT_TIMEOUT = 15.0
 
 # Unity window wake-up: minimum interval between attempts (seconds)
 FOCUS_MIN_INTERVAL = 0.5
@@ -177,6 +194,220 @@ def _focus_unity_window() -> bool:
     except Exception as e:
         logger.debug(f"Focus: failed - {e}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Unity process control (unity_kill / unity_restart)
+#
+# These helpers are pure Python/OS-side and MUST work when the Unity editor
+# is frozen or dead - no Unity WebSocket roundtrip is allowed here.
+# ---------------------------------------------------------------------------
+
+def _norm_path(p: str) -> str:
+    """Normalize a filesystem path for case-insensitive, separator-tolerant comparison."""
+    return str(p).replace("\\", "/").rstrip("/").lower()
+
+
+def _get_project_root() -> Path:
+    """Unity project root derived from this script's location.
+
+    The server lives at <project>/Assets/StreamingAssets/realvirtual-MCP/,
+    so the project root is three directory levels up.
+    """
+    return Path(__file__).resolve().parents[3]
+
+
+def _extract_projectpath(cmdline: str) -> str | None:
+    """Extract the -projectpath/-projectPath argument value from a command line."""
+    if not cmdline:
+        return None
+    m = re.search(
+        r'-projectpath\s+(?:"([^"]+)"|\'([^\']+)\'|([^\s"]+))',
+        cmdline, re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1) or m.group(2) or m.group(3)
+
+
+def _query_unity_processes() -> list[dict]:
+    """List all running Unity.exe processes with PID, exe path and command line.
+
+    Uses PowerShell Get-CimInstance (Win32_Process). Works without Unity.
+    Returns [] on non-Windows platforms or query failure.
+    """
+    if sys.platform != "win32":
+        return []
+    ps_script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='Unity.exe'\" | "
+        "Select-Object ProcessId,ExecutablePath,CommandLine | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=PROCESS_QUERY_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.warning(f"Unity process query failed: {e}")
+        return []
+
+    out = (proc.stdout or "").strip()
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):  # single process -> object, not array
+        data = [data]
+
+    result = []
+    for entry in data:
+        pid = entry.get("ProcessId")
+        if not pid:
+            continue
+        result.append({
+            "pid": int(pid),
+            "exe": entry.get("ExecutablePath") or "",
+            "cmdline": entry.get("CommandLine") or "",
+        })
+    return result
+
+
+def _find_project_unity_processes(project_root: Path) -> list[dict]:
+    """Find Unity.exe processes (editor + asset import workers) whose -projectpath
+    matches THIS project. Unity instances of other projects are never returned.
+    """
+    target = _norm_path(str(project_root))
+    matches = []
+    for proc in _query_unity_processes():
+        proj = _extract_projectpath(proc["cmdline"])
+        if proj and _norm_path(proj) == target:
+            matches.append(proc)
+    return matches
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check whether a process is still running.
+
+    Windows-safe: uses OpenProcess/GetExitCodeProcess. Never use os.kill(pid, 0)
+    on Windows - it TERMINATES the target process instead of probing it.
+    """
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return exit_code.value == STILL_ACTIVE
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _kill_unity_processes(project_root: Path) -> dict:
+    """Force-kill all Unity.exe processes belonging to THIS project (blocking).
+
+    Process-selective: only PIDs whose command line -projectpath matches
+    project_root are killed. Never touches this Python process or Unity
+    instances of other projects.
+
+    Returns {"killed": [{pid, exe, cmdline}], "exe": <remembered editor exe>}.
+    """
+    procs = _find_project_unity_processes(project_root)
+    if not procs:
+        return {"killed": [], "exe": None}
+
+    remembered_exe = None
+    for p in procs:
+        if p["exe"] and p["exe"].lower().endswith("unity.exe"):
+            remembered_exe = p["exe"]
+            break
+
+    own_pid = os.getpid()
+    pids = [p["pid"] for p in procs if p["pid"] != own_pid]
+    if pids:
+        pid_list = ",".join(str(p) for p in pids)
+        logger.info(f"Killing Unity processes for {project_root}: {pid_list}")
+        try:
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Stop-Process -Id {pid_list} -Force -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=PROCESS_QUERY_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.warning(f"Stop-Process failed: {e}")
+
+    return {
+        "killed": [{"pid": p["pid"], "exe": p["exe"]} for p in procs],
+        "exe": remembered_exe,
+    }
+
+
+def _find_unity_exe(project_root: Path) -> str | None:
+    """Locate Unity.exe for this project via Unity Hub installations.
+
+    Reads ProjectSettings/ProjectVersion.txt (m_EditorVersion) and prefers the
+    exact matching Unity Hub installation; falls back to the newest installed
+    editor under C:/Program Files/Unity/Hub/Editor.
+    """
+    editor_version = None
+    version_file = project_root / "ProjectSettings" / "ProjectVersion.txt"
+    try:
+        for line in version_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("m_EditorVersion:"):
+                editor_version = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+
+    hub_dir = Path("C:/Program Files/Unity/Hub/Editor")
+    if not hub_dir.exists():
+        return None
+
+    # Exact version match first
+    if editor_version:
+        exact = hub_dir / editor_version / "Editor" / "Unity.exe"
+        if exact.exists():
+            return str(exact)
+
+    # Fallback: newest installed editor (by folder modification time)
+    candidates = []
+    try:
+        for d in hub_dir.iterdir():
+            exe = d / "Editor" / "Unity.exe"
+            if exe.exists():
+                candidates.append((d.stat().st_mtime, str(exe)))
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _start_unity(exe: str, project_root: Path) -> int:
+    """Start Unity detached with -projectpath (no waiting). Returns the new PID."""
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    proc = subprocess.Popen(
+        [exe, "-projectpath", str(project_root)],
+        creationflags=flags,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    return proc.pid
 
 
 def discover_unity_port(project_path: str | None = None) -> int | None:
@@ -379,6 +610,275 @@ class CircuitBreaker:
         self.failure_count = 0
 
 
+class WebViewerBridge:
+    """WebSocket server for browser MCP tool connections.
+
+    The browser's McpBridgePlugin connects as a WebSocket client and:
+    - Sends a 'discover' message with tool schemas and instructions on connect
+    - Receives 'call' messages from Python (forwarded MCP tool calls)
+    - Returns 'result' messages with tool execution results
+
+    Protocol:
+      Browser -> Python: { type: 'discover', tools: [...], instructions: '...', schema_version: '1.0.0' }
+      Python -> Browser: { type: 'call', id: N, tool: 'web_drive_list', arguments: {} }
+      Browser -> Python: { type: 'result', id: N, result: '...' }
+      Browser -> Python: { type: 'result', id: N, error: '...' }
+    """
+
+    def __init__(self, host: str = DEFAULT_WS_HOST, port: int = DEFAULT_WV_PORT,
+                 mcp_server: Any = None):
+        self.host = host
+        self.port = port
+        self._mcp_server = mcp_server
+        self._wv_registered_names: set[str] = set()  # Separate from Unity registered_names
+        self._browser_ws: Any = None
+        self._connected = False
+        self._cmd_id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._tools: list[dict] = []
+        self._instructions: str = ""
+        self._server: Any = None
+
+    @property
+    def connected(self) -> bool:
+        return self._connected and self._browser_ws is not None
+
+    async def start(self):
+        """Start the WebSocket server for browser connections."""
+        if not HAS_WEBSOCKETS:
+            logger.warning("WebViewer bridge: websockets package not installed")
+            return
+
+        try:
+            self._server = await websockets.serve(
+                self._handle_browser,
+                self.host,
+                self.port,
+                ping_interval=20,
+                ping_timeout=20,
+            )
+            logger.info(
+                f"WebViewer bridge listening on "
+                f"ws://{self.host}:{self.port}/webviewer"
+            )
+        except OSError as e:
+            logger.warning(f"WebViewer bridge: cannot bind port {self.port}: {e}")
+
+    async def stop(self):
+        """Stop the WebSocket server."""
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+        self._connected = False
+        self._browser_ws = None
+
+    async def _handle_browser(self, websocket, path=None):
+        """Handle a single browser WebSocket connection."""
+        remote = getattr(websocket, 'remote_address', ('?', '?'))
+        logger.info(f"WebViewer browser connected from {remote}")
+
+        # Close old browser connection when new one arrives (two-tab scenario)
+        if self._browser_ws is not None and self._browser_ws is not websocket:
+            logger.info("Closing previous WebViewer browser connection")
+            try:
+                await self._browser_ws.close(code=1008, reason="Another tab connected")
+            except Exception:
+                pass
+            self._reject_all_pending()
+
+        self._browser_ws = websocket
+        self._connected = True
+
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "discover":
+                        await self._handle_discover(data)
+
+                    elif msg_type == "result":
+                        self._resolve_pending(data)
+
+                except Exception as e:
+                    logger.warning(f"WebViewer: error handling message: {e}")
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("WebViewer browser disconnected")
+        finally:
+            self._connected = False
+            self._browser_ws = None
+            self._reject_all_pending()
+            # Clear web_* tool names on disconnect (do NOT touch Unity registered_names)
+            self._wv_registered_names.clear()
+            logger.info(f"WebViewer tools cleared on disconnect")
+
+    async def _handle_discover(self, data: dict):
+        """Handle discover message from browser: register web_* tools with FastMCP."""
+        tools = data.get("tools", [])
+        instructions = data.get("instructions", "")
+        schema_version = data.get("schema_version", "unknown")
+
+        self._tools = tools
+        self._instructions = instructions
+
+        logger.info(
+            f"WebViewer discover: {len(tools)} tools, "
+            f"schema_version={schema_version}, "
+            f"instructions={len(instructions)} chars"
+        )
+
+        # Clear old web_* tools before re-registering
+        self._wv_registered_names.clear()
+
+        # Register browser tools with FastMCP
+        self._register_web_tools(tools)
+
+        # Combine WV instructions with existing MCP instructions
+        if instructions and self._mcp_server:
+            try:
+                existing = getattr(self._mcp_server._mcp_server, 'instructions', '') or ''
+                # Append WV instructions if not already present
+                if instructions not in existing:
+                    combined = f"{existing}\n\n{instructions}" if existing else instructions
+                    self._mcp_server._mcp_server.instructions = combined
+                    logger.info(f"Updated MCP instructions with WebViewer context")
+            except Exception as e:
+                logger.debug(f"Could not update MCP instructions: {e}")
+
+        # Notify MCP client that tool list changed
+        if self._mcp_server and hasattr(self._mcp_server, '_notify_tools_changed'):
+            try:
+                await self._mcp_server._notify_tools_changed()
+                logger.info("Sent tools/list_changed after WebViewer discover")
+            except Exception as e:
+                logger.debug(f"Could not notify tools changed: {e}")
+
+    def _register_web_tools(self, tools: list[dict]):
+        """Register browser-defined tools with FastMCP.
+
+        Similar to register_tools() but uses _wv_registered_names and
+        routes calls to the browser via call_tool() instead of Unity.
+        """
+        if not self._mcp_server:
+            logger.warning("WebViewer bridge: no MCP server to register tools with")
+            return
+
+        count = 0
+        for tool_schema in tools:
+            name = tool_schema.get("name", "")
+            description = tool_schema.get("description", f"WebViewer tool: {name}")
+            input_schema = tool_schema.get("inputSchema", {})
+
+            if not name or name in self._wv_registered_names:
+                continue
+
+            properties = input_schema.get("properties", {})
+            required = set(input_schema.get("required", []))
+
+            def make_handler(tool_name: str, tool_props: dict, tool_required: set):
+                async def handler(**kwargs):
+                    # Claude Code MCP proxy wraps all params into a single "kwargs" string.
+                    # Unwrap it back into individual arguments for the browser.
+                    if "kwargs" in kwargs and len(kwargs) == 1 and isinstance(kwargs["kwargs"], str):
+                        raw = kwargs["kwargs"]
+                        try:
+                            parsed = json.loads(raw)
+                            if isinstance(parsed, dict):
+                                kwargs = parsed
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    result = await self.call_tool(tool_name, kwargs)
+                    return result
+
+                handler.__name__ = tool_name
+                handler.__qualname__ = tool_name
+                handler.__doc__ = description
+
+                annotations = {}
+                for param_name, param_info in tool_props.items():
+                    json_type = param_info.get("type", "string")
+                    type_map = {
+                        "string": str,
+                        "number": float,
+                        "integer": int,
+                        "boolean": bool,
+                    }
+                    py_type = type_map.get(json_type, str)
+
+                    if param_name not in tool_required:
+                        py_type = py_type | None
+
+                    annotations[param_name] = py_type
+
+                handler.__annotations__ = annotations
+                return handler
+
+            fn = make_handler(name, properties, required)
+            try:
+                self._mcp_server.add_tool(fn, name=name, description=description)
+                self._wv_registered_names.add(name)
+                count += 1
+            except Exception as e:
+                logger.error(f"Failed to register WebViewer tool '{name}': {e}")
+
+        if count > 0:
+            logger.info(f"Registered {count} WebViewer tools with FastMCP")
+
+    async def call_tool(self, tool_name: str, arguments: dict,
+                        timeout: float = 5.0) -> str:
+        """Forward tool call to browser and wait for result.
+
+        Returns JSON string (result from browser or error message).
+        """
+        if not self._connected or not self._browser_ws:
+            return json.dumps({"error": "WebViewer not connected"})
+
+        self._cmd_id += 1
+        cmd_id = self._cmd_id
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending[cmd_id] = future
+
+        try:
+            await self._browser_ws.send(json.dumps({
+                "type": "call",
+                "id": cmd_id,
+                "tool": tool_name,
+                "arguments": arguments,
+            }))
+        except Exception as e:
+            self._pending.pop(cmd_id, None)
+            return json.dumps({"error": f"WebSocket send failed: {e}"})
+
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+            # Browser sends { type: 'result', id, result: '...' } or { ..., error: '...' }
+            if "error" in result:
+                return json.dumps({"error": result["error"]})
+            return result.get("result", json.dumps({"error": "No result from browser"}))
+        except asyncio.TimeoutError:
+            self._pending.pop(cmd_id, None)
+            return json.dumps({"error": "Browser tool call timeout"})
+
+    def _resolve_pending(self, data: dict):
+        """Resolve a pending future from a browser result message."""
+        cmd_id = data.get("id")
+        future = self._pending.pop(cmd_id, None)
+        if future and not future.done():
+            future.set_result(data)
+
+    def _reject_all_pending(self):
+        """Reject all pending futures (e.g. on disconnect)."""
+        for cmd_id, future in self._pending.items():
+            if not future.done():
+                future.set_result({"error": "Browser disconnected"})
+        self._pending.clear()
+
+
 class UnityConnection:
     """Manages the WebSocket connection to Unity and tool discovery/execution."""
 
@@ -401,6 +901,11 @@ class UnityConnection:
         self._reconnect_attempts = 0
         self.buffer = MessageBuffer()
         self.circuit_breaker = CircuitBreaker()
+        # Main-thread liveness: reported by the Unity heartbeat
+        # (main_thread_inactive_s field) or derived from dispatch error texts.
+        # None = unknown (e.g. old Unity package without the heartbeat field).
+        self._main_thread_inactive_s: float | None = None
+        self._main_thread_report_time: float = 0.0
 
     @property
     def ws_url(self) -> str:
@@ -417,6 +922,30 @@ class UnityConnection:
     @property
     def state(self) -> State:
         return self._state
+
+    @property
+    def main_thread_inactive_s(self) -> float | None:
+        """Last known Unity main-thread pump inactivity in seconds (None = unknown)."""
+        return self._main_thread_inactive_s
+
+    def _note_main_thread(self, inactive_s: float):
+        """Record a main-thread liveness observation."""
+        self._main_thread_inactive_s = inactive_s
+        self._main_thread_report_time = time.monotonic()
+
+    def _track_main_thread_from_error(self, error_text) -> None:
+        """Derive main-thread inactivity from Unity dispatch error messages.
+
+        The C# bridge fails fast with 'Main thread inactive for Xs' when the
+        pump is stalled, and with 'Main thread dispatch timeout' after 30s.
+        """
+        if not isinstance(error_text, str):
+            return
+        m = re.search(r"[Mm]ain thread inactive for (\d+(?:\.\d+)?)s", error_text)
+        if m:
+            self._note_main_thread(float(m.group(1)))
+        elif "Main thread dispatch timeout" in error_text:
+            self._note_main_thread(max(self._main_thread_inactive_s or 0.0, 30.0))
 
     def _set_state(self, new_state: State):
         """Transition to a new state with logging."""
@@ -529,7 +1058,23 @@ class UnityConnection:
                 )
                 self._last_comm_time = time.monotonic()
                 logger.debug(f"<< {label} ({len(response)} bytes)")
-                return json.loads(response)
+                # Parse in its own guard: a malformed tool response (e.g. a tool
+                # building JSON manually with locale decimal commas) is a TOOL
+                # bug, not a dead connection. Never mark the connection as
+                # disconnected or trip the circuit breaker for a parse error -
+                # that caused fake 'reconnecting' loops.
+                try:
+                    return json.loads(response)
+                except (json.JSONDecodeError, ValueError) as e:
+                    preview = response[:200] if isinstance(response, str) else str(response)[:200]
+                    logger.warning(
+                        f"Malformed JSON from Unity for {label}: {e} "
+                        f"(raw: {preview!r})"
+                    )
+                    return {
+                        "error": f"Unity returned malformed JSON for {label}: {e}",
+                        "raw_preview": preview,
+                    }
         except asyncio.TimeoutError:
             logger.error(f"Timeout ({timeout}s) waiting for {label}")
             self.circuit_breaker.record_failure()
@@ -585,7 +1130,14 @@ class UnityConnection:
         return False
 
     async def heartbeat(self) -> dict | None:
-        return await self._send_command({"command": "__heartbeat__"})
+        hb = await self._send_command({"command": "__heartbeat__"})
+        if hb is not None:
+            # Unity reports pump inactivity in the heartbeat (answered on a
+            # background thread, so this works even while the main thread hangs).
+            mt = hb.get("main_thread_inactive_s")
+            if isinstance(mt, (int, float)) and mt >= 0:
+                self._note_main_thread(float(mt))
+        return hb
 
     async def _execute_tool_call(self, tool_name: str,
                                 arguments: dict) -> str:
@@ -614,7 +1166,14 @@ class UnityConnection:
             })
 
         if "error" in response:
-            return json.dumps({"error": response["error"]})
+            self._track_main_thread_from_error(response["error"])
+            err = {"error": response["error"]}
+            if "raw_preview" in response:
+                err["raw_preview"] = response["raw_preview"]
+            return json.dumps(err)
+
+        # A successful result proves the Unity main thread just executed the call
+        self._note_main_thread(0.0)
 
         result = response.get("result", response)
         return result if isinstance(result, str) else json.dumps(result)
@@ -726,6 +1285,21 @@ def save_schema_cache(tools: list[dict], schema_version: str,
                       cache_dir: Path | None = None,
                       instructions: str = ""):
     cache_path = get_cache_path(cache_dir)
+
+    # Skip the write when nothing changed (ignoring the cached_at timestamp).
+    # The cache lives under Assets/StreamingAssets - every write triggers a
+    # Unity asset refresh, which cascaded badly during reconnect loops.
+    try:
+        if cache_path.exists():
+            existing = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (existing.get("tools") == tools
+                    and existing.get("schema_version") == schema_version
+                    and existing.get("instructions", "") == (instructions or "")):
+                logger.debug("Schema cache unchanged, skipping write")
+                return
+    except Exception:
+        pass  # Unreadable/corrupt cache - rewrite it below
+
     cache_data = {
         "schema_version": schema_version,
         "cached_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -882,13 +1456,15 @@ def create_server(
     cache_dir: Path | None = None,
     http_host: str = "0.0.0.0",
     http_port: int = 8000,
-) -> tuple[FastMCP, "UnityConnection", set[str], list]:
+    web_port: int = DEFAULT_WV_PORT,
+    no_webviewer: bool = False,
+) -> tuple[FastMCP, "UnityConnection", set[str], list, "WebViewerBridge | None"]:
     """Create and configure the FastMCP server.
 
     Pre-loads cached tools so they are available immediately when
     Claude Code starts, even before Unity is connected.
 
-    Returns (mcp_server, unity, registered_names, watchdog_holder).
+    Returns (mcp_server, unity, registered_names, watchdog_holder, wv_bridge).
     Caller should set watchdog_holder[0] to an async ensure_watchdog callback.
     """
     mcp_server = FastMCP("realvirtual", host=http_host, port=http_port)
@@ -936,6 +1512,19 @@ def create_server(
             hb = await unity.heartbeat()
             if hb:
                 status["heartbeat"] = hb
+            # Honest main-thread status: the heartbeat is answered on a Unity
+            # background thread and stays green even when the main thread is
+            # frozen. main_thread_inactive_s comes from the heartbeat (new
+            # Unity package) or from dispatch error texts (fallback).
+            mt = unity.main_thread_inactive_s
+            if mt is not None:
+                status["main_thread_inactive_s"] = round(mt, 1)
+                status["main_thread_alive"] = mt < MAIN_THREAD_STALL_THRESHOLD
+                if mt >= MAIN_THREAD_STALL_THRESHOLD:
+                    status["hint"] = (
+                        "Unity main thread appears blocked - if this persists, "
+                        "use unity_kill or unity_restart"
+                    )
         return json.dumps(status, indent=2)
 
     unity_status.__name__ = "unity_status"
@@ -1019,10 +1608,29 @@ def create_server(
 
         _record_phase("waiting")
 
+        # Last observed main-thread inactivity while blocked (None = not blocked)
+        last_blocked_s: float | None = None
+
         while True:
             elapsed = time.monotonic() - start
             if elapsed >= timeout:
                 _record_phase("timeout")
+                if last_blocked_s is not None:
+                    # Honest answer: the relay/WebSocket is alive but the Unity
+                    # main thread is frozen - this is NOT 'ready' and waiting
+                    # longer will not help.
+                    return json.dumps({
+                        "status": "blocked",
+                        "error": f"Unity main thread blocked "
+                                 f"(inactive for {last_blocked_s:.0f}s) after "
+                                 f"waiting {timeout:.0f}s",
+                        "main_thread_inactive_s": round(last_blocked_s, 1),
+                        "hint": "Unity Editor appears frozen - use unity_kill "
+                                "or unity_restart",
+                        "state": unity.state.value,
+                        "elapsed": round(elapsed, 1),
+                        "phases": phases,
+                    })
                 return json.dumps({
                     "status": "timeout",
                     "error": f"Unity not ready after {timeout:.0f}s",
@@ -1035,11 +1643,34 @@ def create_server(
             if unity.connected:
                 hb = await unity.heartbeat()
                 if hb and hb.get("status") == "ok":
+                    # The heartbeat is answered on a Unity background thread and
+                    # succeeds even while the main thread is frozen. Check the
+                    # reported pump inactivity before trusting anything else.
+                    mt = unity.main_thread_inactive_s
+                    if mt is not None and mt >= MAIN_THREAD_STALL_THRESHOLD:
+                        last_blocked_s = mt
+                        _record_phase("blocked")
+                        await asyncio.sleep(poll_interval)
+                        continue
                     # Also check if Unity is still compiling/importing
                     try:
                         status_result = await unity._execute_tool_call(
                             "editor_get_status", {})
                         status_data = json.loads(status_result)
+                        error_text = status_data.get("error")
+                        if error_text:
+                            # Dispatch failed (main thread stalled, dispatcher
+                            # unavailable, reload) - NOT ready. Never fall
+                            # through to 'ready' on an error response.
+                            mt = unity.main_thread_inactive_s
+                            if mt is not None and mt >= MAIN_THREAD_STALL_THRESHOLD:
+                                last_blocked_s = mt
+                                _record_phase("blocked")
+                            else:
+                                _record_phase("busy")
+                            await asyncio.sleep(poll_interval)
+                            continue
+                        last_blocked_s = None
                         is_playing = status_data.get("isPlaying", False)
                         if is_playing:
                             _record_phase("playing")
@@ -1099,11 +1730,163 @@ def create_server(
         ),
     )
 
+    # --- Process control tools (work even when Unity is frozen or dead) ---
+    # Pure Python/OS-side: no Unity WebSocket roundtrip involved. These are the
+    # rescue path when the Unity main thread hangs ('Hold on' dialog, frozen
+    # editor) and normal tools only time out.
+
+    # Unity editor exe remembered from the last kill (preferred restart source)
+    _remembered_unity_exe: list = [None]
+
+    async def unity_kill() -> str:
+        """Force-kill the Unity Editor process of THIS project.
+
+        Process-selective: only Unity.exe processes whose -projectpath command
+        line matches this project are killed (including asset import workers).
+        Other Unity instances and this Python server are never touched.
+        Works even when Unity is completely frozen - pure OS-level operation.
+        """
+        loop = asyncio.get_running_loop()
+        project_root = _get_project_root()
+        result = await loop.run_in_executor(
+            None, _kill_unity_processes, project_root)
+        if result["exe"]:
+            _remembered_unity_exe[0] = result["exe"]
+        # Drop our stale websocket so the watchdog reconnects cleanly later
+        try:
+            await unity.disconnect()
+        except Exception:
+            pass
+        if not result["killed"]:
+            return json.dumps({
+                "status": "no_process",
+                "message": "No Unity.exe with matching -projectpath found",
+                "project_root": str(project_root),
+            })
+        return json.dumps({
+            "status": "killed",
+            "killed_pids": [p["pid"] for p in result["killed"]],
+            "processes": result["killed"],
+            "project_root": str(project_root),
+        })
+
+    unity_kill.__name__ = "unity_kill"
+    mcp_server.add_tool(
+        unity_kill,
+        name="unity_kill",
+        description=(
+            "Force-kill the frozen/hanging Unity Editor process of THIS project "
+            "(matched via -projectpath; other Unity instances stay untouched). "
+            "Pure OS-level - works even when Unity is completely unresponsive."
+        ),
+    )
+
+    async def unity_restart() -> str:
+        """Kill the Unity Editor of THIS project and start it again.
+
+        Kills all matching Unity processes, waits until the PIDs are gone
+        (timeout 15s), then starts Unity detached with -projectpath. The
+        Unity exe is remembered from the killed process; fallback is the
+        matching Unity Hub installation for ProjectSettings/ProjectVersion.txt.
+        """
+        loop = asyncio.get_running_loop()
+        project_root = _get_project_root()
+
+        kill_result = await loop.run_in_executor(
+            None, _kill_unity_processes, project_root)
+        if kill_result["exe"]:
+            _remembered_unity_exe[0] = kill_result["exe"]
+        try:
+            await unity.disconnect()
+        except Exception:
+            pass
+
+        # Wait until the killed PIDs are really gone before restarting
+        killed_pids = [p["pid"] for p in kill_result["killed"]]
+        still_alive = list(killed_pids)
+        deadline = time.monotonic() + KILL_WAIT_TIMEOUT
+        while still_alive and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            checks = [
+                await loop.run_in_executor(None, _pid_alive, pid)
+                for pid in still_alive
+            ]
+            still_alive = [pid for pid, alive in zip(still_alive, checks) if alive]
+        if still_alive:
+            return json.dumps({
+                "status": "kill_timeout",
+                "error": f"Unity PIDs still alive after "
+                         f"{KILL_WAIT_TIMEOUT:.0f}s: {still_alive}",
+                "hint": "Retry unity_restart or kill manually via Task Manager",
+                "project_root": str(project_root),
+            })
+
+        # Resolve Unity.exe: remembered from kill > Unity Hub installation
+        exe = _remembered_unity_exe[0]
+        if not exe or not Path(exe).exists():
+            exe = await loop.run_in_executor(None, _find_unity_exe, project_root)
+        if not exe:
+            return json.dumps({
+                "status": "failed",
+                "error": "Unity.exe not found (no running instance to learn "
+                         "from and no matching Unity Hub installation)",
+                "project_root": str(project_root),
+            })
+
+        try:
+            new_pid = await loop.run_in_executor(
+                None, _start_unity, exe, project_root)
+        except OSError as e:
+            return json.dumps({
+                "status": "failed",
+                "error": f"Unity start failed: {e}",
+                "exe": exe,
+            })
+
+        # Reset relay state so the watchdog reconnects once Unity is up
+        unity._reconnect_attempts = 0
+        if unity.state == State.ERROR:
+            unity._set_state(State.RECONNECTING)
+        await _trigger_watchdog()
+
+        return json.dumps({
+            "status": "started",
+            "pid": new_pid,
+            "exe": exe,
+            "killed_pids": killed_pids,
+            "project_root": str(project_root),
+            "hint": "Unity is starting - use editor_wait_ready to wait for readiness",
+        })
+
+    unity_restart.__name__ = "unity_restart"
+    mcp_server.add_tool(
+        unity_restart,
+        name="unity_restart",
+        description=(
+            "Kill the Unity Editor of THIS project and start it again with "
+            "-projectpath (rescue for a frozen editor). Waits for the killed "
+            "PIDs to disappear, then launches Unity detached. Works even when "
+            "Unity is completely unresponsive."
+        ),
+    )
+
     # screenshot_editor is intercepted Python-side in call_tool() using Win32
     # PrintWindow API for reliable capture even when Unity is backgrounded.
     # Falls back to the C# implementation if Python capture fails.
 
-    return mcp_server, unity, registered_names, watchdog_holder
+    # --- WebViewer bridge ---
+    wv_bridge: WebViewerBridge | None = None
+    if not no_webviewer:
+        wv_bridge = WebViewerBridge(
+            host=ws_host,
+            port=web_port,
+            mcp_server=mcp_server,
+        )
+        logger.info(f"WebViewer bridge created (port {web_port})")
+    else:
+        logger.info("WebViewer bridge disabled (--no-webviewer)")
+
+    return mcp_server, unity, registered_names, watchdog_holder, wv_bridge
 
 
 def _capture_screenshot_editor(arguments: dict) -> str:
@@ -1438,6 +2221,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--verbose", "-v", action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--web-port", type=int, default=DEFAULT_WV_PORT,
+        help=f"WebViewer WebSocket port (default: {DEFAULT_WV_PORT})"
+    )
+    parser.add_argument(
+        "--no-webviewer", action="store_true",
+        help="Disable WebViewer bridge (no web_* tools)"
+    )
     return parser.parse_args(argv)
 
 
@@ -1497,12 +2288,14 @@ def main(argv: list[str] | None = None):
         logger.error(f"Invalid WebSocket port: {ws_port}")
         sys.exit(1)
 
-    mcp_server, unity, registered_names, watchdog_holder = create_server(
+    mcp_server, unity, registered_names, watchdog_holder, wv_bridge = create_server(
         ws_host=args.ws_host,
         ws_port=ws_port,
         auth_token=args.auth_token,
         cache_dir=args.cache_dir,
         http_port=args.http_port,
+        web_port=args.web_port,
+        no_webviewer=args.no_webviewer,
     )
 
     # Watchdog startup with lazy fallback via tool calls
@@ -1523,12 +2316,24 @@ def main(argv: list[str] | None = None):
     # Wire up the watchdog callback into the holder from create_server
     watchdog_holder[0] = _ensure_watchdog
 
-    # Hook watchdog into FastMCP lifecycle (primary start mechanism)
+    # Start WebViewer bridge as background task
+    _wv_bridge_started = False
+
+    async def _ensure_wv_bridge():
+        nonlocal _wv_bridge_started
+        if _wv_bridge_started or wv_bridge is None:
+            return
+        _wv_bridge_started = True
+        logger.info("Starting WebViewer bridge")
+        asyncio.ensure_future(wv_bridge.start())
+
+    # Hook watchdog + WV bridge into FastMCP lifecycle (primary start mechanism)
     try:
         async def _init_handler(notification):
             await _ensure_watchdog()
+            await _ensure_wv_bridge()
         mcp_server._mcp_server.notification_handlers[InitializedNotification] = _init_handler
-        logger.debug("Watchdog hooked into MCP initialized notification")
+        logger.debug("Watchdog + WV bridge hooked into MCP initialized notification")
     except Exception as e:
         logger.warning(f"Could not hook watchdog into MCP lifecycle: {e}")
 
@@ -1578,9 +2383,10 @@ def main(argv: list[str] | None = None):
                 logger.debug(f"Could not send tools/list_changed: {e}")
     mcp_server._notify_tools_changed = notify_tools_changed
 
+    wv_info = f", webviewer={args.ws_host}:{args.web_port}" if wv_bridge else ", webviewer=disabled"
     logger.info(
         f"Starting realvirtual MCP Server (mode={args.mode}, "
-        f"ws={args.ws_host}:{ws_port})"
+        f"ws={args.ws_host}:{ws_port}{wv_info})"
     )
 
     if args.mode == "sse":
