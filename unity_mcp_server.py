@@ -7,6 +7,14 @@ WebSocket bridge between realvirtual.io Unity Digital Twin and MCP clients.
 Unity defines MCP tools via C# [McpTool] attributes. This Python server
 discovers them automatically via WebSocket and registers them as FastMCP tools.
 
+Tool ownership (plan-327 AP1):
+  This server owns the Unity Editor tools. The web_* browser tools of realvirtual WEB
+  belong to realvirtual CONNECT (http://localhost:5100/mcp) - one host per tool family,
+  no overlap. The WebViewer bridge below is a historic proxy that duplicates those names.
+  Since plan-468 it is OFF by default and has to be asked for with --webviewer: it served
+  web_* on port 18712 with no token and no license check, which was a way around CONNECT's
+  community registration. --no-webviewer is still accepted and does nothing.
+
 Modes:
   stdio  - For Claude Desktop / Claude Code (default)
   sse    - HTTP/SSE for network clients
@@ -24,7 +32,7 @@ WebSocket Protocol (Port 18711):
   __heartbeat__ -> {status: "ok", tools_count: N}
 """
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import argparse
 import asyncio
@@ -1457,7 +1465,7 @@ def create_server(
     http_host: str = "0.0.0.0",
     http_port: int = 8000,
     web_port: int = DEFAULT_WV_PORT,
-    no_webviewer: bool = False,
+    webviewer: bool = False,
 ) -> tuple[FastMCP, "UnityConnection", set[str], list, "WebViewerBridge | None"]:
     """Create and configure the FastMCP server.
 
@@ -1876,7 +1884,7 @@ def create_server(
 
     # --- WebViewer bridge ---
     wv_bridge: WebViewerBridge | None = None
-    if not no_webviewer:
+    if webviewer:
         wv_bridge = WebViewerBridge(
             host=ws_host,
             port=web_port,
@@ -1884,7 +1892,10 @@ def create_server(
         )
         logger.info(f"WebViewer bridge created (port {web_port})")
     else:
-        logger.info("WebViewer bridge disabled (--no-webviewer)")
+        logger.info(
+            "WebViewer bridge disabled (default since plan-468; use --webviewer). "
+            "web_* tools are served by realvirtual CONNECT on http://localhost:5100/mcp"
+        )
 
     return mcp_server, unity, registered_names, watchdog_holder, wv_bridge
 
@@ -2226,9 +2237,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"WebViewer WebSocket port (default: {DEFAULT_WV_PORT})"
     )
     parser.add_argument(
-        "--no-webviewer", action="store_true",
-        help="Disable WebViewer bridge (no web_* tools)"
+        "--webviewer", action="store_true",
+        help="Start the historic web_* WebSocket proxy on --web-port. OFF by default since "
+             "plan-468: it answered web_* without a token and without a license check, past "
+             "CONNECT's community registration. web_* is owned by realvirtual CONNECT on "
+             "http://localhost:5100/mcp"
     )
+    # Accepted and ignored. It was the way to switch the proxy off while it was on by default,
+    # so it sits in existing .mcp.json and Claude Desktop configs; failing on it would break
+    # exactly the setups that already did the right thing. argparse.SUPPRESS keeps it out of
+    # --help so nobody adopts it anew.
+    parser.add_argument("--no-webviewer", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -2295,7 +2314,7 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         http_port=args.http_port,
         web_port=args.web_port,
-        no_webviewer=args.no_webviewer,
+        webviewer=args.webviewer and not args.no_webviewer,
     )
 
     # Watchdog startup with lazy fallback via tool calls
